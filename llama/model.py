@@ -18,12 +18,14 @@ from torch import nn
 
 @dataclass
 class ModelArgs:
+    # dim: int = 4096
     dim: int = 4096
-    n_layers: int = 32
+    # n_layers: int = 32
+    n_layers: int = 2
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
     vocab_size: int = -1  # defined later by tokenizer
-    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
+    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2 # TODO
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
 
@@ -153,8 +155,10 @@ def apply_rotary_emb(
         
 
     """
+    # TODO 不是特别理解, 为什么这里要转为float来计算
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    # freqs_cis的shape由[seq_len, hidden_dim] -> [1, seq_len, 1, hidden_dim], 后续矩阵乘操作做相应广播
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
@@ -204,11 +208,12 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
+        # ColumnParallelLinear的权重分为多列, RowParallelLinear权重分为多行
         self.wq = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
-            gather_output=False,
+            gather_output=False, # 张量并行实现, 这里禁止合并结果
             init_method=lambda x: x,
         )
         self.wk = ColumnParallelLinear(
@@ -229,7 +234,7 @@ class Attention(nn.Module):
             args.n_heads * self.head_dim,
             args.dim,
             bias=False,
-            input_is_parallel=True,
+            input_is_parallel=True, # 张量并行实现, 这里才同步所有worker上的结果
             init_method=lambda x: x,
         )
 
@@ -279,7 +284,7 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k = self.cache_k.to(xq)
+        self.cache_k = self.cache_k.to(xq) # to可以输入一个tensor, 表示to到输入tensor相同的设备和类型上面
         self.cache_v = self.cache_v.to(xq)
 
         self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
@@ -288,6 +293,8 @@ class Attention(nn.Module):
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
 
+        # GQA, 一个q可以对应n_rep个kv
+        # 下面将kv分组按头数拷贝, 使与q头数一直
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
         values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
@@ -297,10 +304,11 @@ class Attention(nn.Module):
         values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
+            # 任意一个数加-inf还是-inf
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq) # 避免溢出, 转换为float32再进行softmax操作
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1) # view需要tensor的内存是连续的, 因此在view前调用contiguous
         return self.wo(output)
 
 
@@ -328,11 +336,11 @@ class FeedForward(nn.Module):
 
         """
         super().__init__()
-        hidden_dim = int(2 * hidden_dim / 3)
+        hidden_dim = int(2 * hidden_dim / 3) # TODO
         # custom dim factor multiplier
         if ffn_dim_multiplier is not None:
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
-        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of) # 确保最终的隐藏层维度是multiple_of的倍数
 
         self.w1 = ColumnParallelLinear(
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
@@ -345,7 +353,7 @@ class FeedForward(nn.Module):
         )
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2(F.silu(self.w1(x)) * self.w3(x)) # 这里实际上是使用silu来实现swiglu
 
 
 class TransformerBlock(nn.Module):
@@ -372,6 +380,7 @@ class TransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
+        # 参考了Megatron-LM v1来实现张量并行, atte的qkv矩阵按列划分, o矩阵按行划分, ffn的第一阶段linear按列划分, 第二阶段linear按行划分
         self.attention = Attention(args)
         self.feed_forward = FeedForward(
             dim=args.dim,
@@ -434,6 +443,7 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
+        # 输入完整, 但是只处理单个worker在范围内的输入, 范围外设为0, 最后执行all_reduce同步所有worker上的结果
         self.tok_embeddings = ParallelEmbedding(
             params.vocab_size, params.dim, init_method=lambda x: x
         )
@@ -443,17 +453,19 @@ class Transformer(nn.Module):
             self.layers.append(TransformerBlock(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = ColumnParallelLinear(
+        # 处理单个worker的局部输入, 最后执行all_gather合并所有worker上的结果
+        self.output = ColumnParallelLinear( # gather_output默认为True, 结束后会同步所有worker上的结果
             params.dim, params.vocab_size, bias=False, init_method=lambda x: x
         )
 
         self.freqs_cis = precompute_freqs_cis(
             # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096. 
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
-            self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
+            self.params.dim // self.params.n_heads, self.params.max_seq_len * 2 # TODO
         )
 
-    @torch.inference_mode()
+    # 根据 https://github.com/meta-llama/llama/issues/180#issuecomment-1465061549
+    # @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
         """
         Perform a forward pass through the Transformer model.
@@ -477,7 +489,10 @@ class Transformer(nn.Module):
                 (seqlen, seqlen), float("-inf"), device=tokens.device
             )
 
-            mask = torch.triu(mask, diagonal=1)
+            # diagonal=0, 保留右上三角部分, 对角线保留, 其他部分设为0
+            # diagonal=1, 保留右上三角部分, 对角线不保留, 不保留的部分设为0
+            # diagonal为正, 不保留部分往上移, 反之往下移动
+            mask = torch.triu(mask, diagonal=1) # mask为True的位置, 设为-inf
 
             # When performing key-value caching, we compute the attention scores
             # only for the new sequence. Thus, the matrix of scores is of size

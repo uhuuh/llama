@@ -5,10 +5,13 @@ import fire
 
 from llama import Llama
 from typing import List
+import os
+import torch
 
 def main(
-    ckpt_dir: str,
-    tokenizer_path: str,
+    rank = 0,
+    ckpt_dir: str = None,
+    tokenizer_path: str = None,
     temperature: float = 0.6,
     top_p: float = 0.9,
     max_seq_len: int = 128,
@@ -29,6 +32,11 @@ def main(
         max_gen_len (int, optional): The maximum length of generated sequences. Defaults to 64.
         max_batch_size (int, optional): The maximum batch size for generating sequences. Defaults to 4.
     """ 
+    os.environ['RANK'] = str(rank)
+    print(f"{rank} start...", flush=True)
+    torch.set_grad_enabled(False)
+
+    tokenizer_path = "./tokenizer.model"
     generator = Llama.build(
         ckpt_dir=ckpt_dir,
         tokenizer_path=tokenizer_path,
@@ -53,6 +61,8 @@ def main(
         plush girafe => girafe peluche
         cheese =>""",
     ]
+    prompts = prompts[:2]
+
     results = generator.text_completion(
         prompts,
         max_gen_len=max_gen_len,
@@ -66,4 +76,14 @@ def main(
 
 
 if __name__ == "__main__":
-    fire.Fire(main)
+    # fire.Fire(main)
+    import torch.multiprocessing as mp
+    world_size = 2
+
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12354'
+
+    mp.spawn(main, nprocs=world_size, join=True)
+
+

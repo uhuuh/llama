@@ -81,8 +81,14 @@ class Llama:
             and loads the pre-trained model and tokenizer.
 
         """
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group("nccl")
+        # if not torch.distributed.is_initialized():
+        #     torch.distributed.init_process_group("nccl")
+
+        # 采用gloo通信后端, 使得单卡场景可以模型多卡场景
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        torch.distributed.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+
         if not model_parallel_is_initialized():
             if model_parallel_size is None:
                 model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -98,26 +104,26 @@ class Llama:
             sys.stdout = open(os.devnull, "w")
 
         start_time = time.time()
-        checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
-        assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}"
-        assert model_parallel_size == len(
-            checkpoints
-        ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
-        ckpt_path = checkpoints[get_model_parallel_rank()]
-        checkpoint = torch.load(ckpt_path, map_location="cpu")
-        with open(Path(ckpt_dir) / "params.json", "r") as f:
-            params = json.loads(f.read())
+        # checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
+        # assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}"
+        # assert model_parallel_size == len(
+        #     checkpoints
+        # ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
+        # ckpt_path = checkpoints[get_model_parallel_rank()]
+        # checkpoint = torch.load(ckpt_path, map_location="cpu")
+        # with open(Path(ckpt_dir) / "params.json", "r") as f:
+        #     params = json.loads(f.read())
 
         model_args: ModelArgs = ModelArgs(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
-            **params,
+            # **params,
         )
         tokenizer = Tokenizer(model_path=tokenizer_path)
         model_args.vocab_size = tokenizer.n_words
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
         model = Transformer(model_args)
-        model.load_state_dict(checkpoint, strict=False)
+        # model.load_state_dict(checkpoint, strict=False)
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
 
         return Llama(model, tokenizer)
@@ -126,7 +132,7 @@ class Llama:
         self.model = model
         self.tokenizer = tokenizer
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def generate(
         self,
         prompt_tokens: List[List[int]],
@@ -184,7 +190,9 @@ class Llama:
             )
 
         for cur_pos in range(min_prompt_len, total_len):
+            # 由于使用了kv cache, 输入的可以是部分序列, pre_pos指明了输入序列在真实序列的起始位置
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            # TODO 为什么temperature为0的时候, 确定性固定下来. 这里仅仅进行了特殊判断, 没有真正回答这个问题
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
